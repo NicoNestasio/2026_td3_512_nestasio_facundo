@@ -9,7 +9,7 @@ from pyqtgraph.Qt import QtWidgets, QtCore
 # ==========================================
 # CONFIGURACIÓN DEL SISTEMA
 # ==========================================
-PUERTO = 'COM11'  # <-- REVISAR Y CAMBIAR AL COM DE TU ESP32
+PUERTO = 'COM8'  # <-- REVISAR Y CAMBIAR AL COM DE TU ESP32
 BAUDIOS = 921600
 PUNTOS_PANTALLA = 400
 V_REF = 3.3
@@ -63,22 +63,22 @@ def leer_ultima_trama():
                 del buffer_bytes[:-1]
             break
         if idx > 0:
-            del buffer_bytes[:idx] 
+            del buffer_bytes[:idx]
         if len(buffer_bytes) < TAMANO_TRAMA:
-            break 
+            break
 
         cruda = bytes(buffer_bytes[:TAMANO_TRAMA])
         del buffer_bytes[:TAMANO_TRAMA]
 
         campos = struct.unpack(FORMATO_TRAMA, cruda)
         if _checksum(cruda[:-2]) != campos[-1]:
-            continue 
+            continue
 
         _, flanco, nivel, tiempo_ms_decimas, amplitud, modo, num_puntos, *resto = campos
         ultima_trama = {
             'flanco': flanco,
             'nivel': nivel,
-            'tiempo_ms': tiempo_ms_decimas / 10.0, 
+            'tiempo_ms': tiempo_ms_decimas / 10.0,
             'amplitud': amplitud,
             'modo': modo,
             'datos': resto[:num_puntos],
@@ -100,7 +100,7 @@ def enviar_estado_actual():
 
     datos_sin_chk = struct.pack('<HBIIfB', SYNC_PC, flanco, nivel, tiempo_decimas, amplitud, modo)
     chk = _checksum(datos_sin_chk)
-    
+
     paquete = struct.pack(FORMATO_CMD, SYNC_PC, flanco, nivel, tiempo_decimas, amplitud, modo, chk)
     ser.write(paquete)
 
@@ -171,11 +171,11 @@ win.setLayout(layout)
 panel_stats = QtWidgets.QLabel("Esperando señal...")
 panel_stats.setAlignment(QtCore.Qt.AlignCenter)
 panel_stats.setStyleSheet("""
-    font-family: monospace; 
-    font-size: 12pt; 
+    font-family: monospace;
+    font-size: 12pt;
     font-weight: bold;
-    background-color: #1e1e1e; 
-    padding: 10px; 
+    background-color: #1e1e1e;
+    padding: 10px;
     border-radius: 5px;
     border: 1px solid #333333;
 """)
@@ -218,7 +218,7 @@ def actualizar_grafico():
         return
 
     if trama is None:
-        return 
+        return
 
     # --- Sincronización Inversa Silenciosa ---
     # Si cambias algo con el encoder del ESP32, actualizamos el diccionario local
@@ -226,12 +226,12 @@ def actualizar_grafico():
     estado_actual['modo'] = trama['modo']
     estado_actual['flanco'] = trama['flanco']
     estado_actual['nivel'] = trama['nivel']
-    
+
     tiempo_decimas = int(trama['tiempo_ms'] * 10)
     tiempos_idx = {5: 0, 10: 1, 20: 2, 50: 3}
     if tiempo_decimas in tiempos_idx:
         estado_actual['tiempo_idx'] = tiempos_idx[tiempo_decimas]
-        
+
     estado_actual['amplitud_idx'] = 0 if trama['amplitud'] == 1.0 else 1
     # ----------------------------------------
 
@@ -241,23 +241,25 @@ def actualizar_grafico():
     amplitud_div_v = trama['amplitud']
     modo_actual = trama['modo']
 
-    factor_amp = 10.0 if modo_actual == 1 else 1.0
+    # factor_amp SOLO se usa para convertir la señal cruda a su valor real
+    # (compensar el divisor de la sonda X10). Ya NO se usa para el rango,
+    # la grilla ni el trigger: eso depende únicamente de amplitud_div_v (comando A).
+    factor_amp = 10 if modo_actual == 1 else 1.0
 
     rango_x = tiempo_div_ms * 10.0
     plot.setXRange(0, rango_x, padding=0)
     plot.getAxis('bottom').setTickSpacing(levels=[(tiempo_div_ms, 0)])
 
-    centro_y = (V_REF / 2.0) * factor_amp
+    centro_y = V_REF / 2.0
     if modo_actual == 2:
-        centro_y = 0.0
+        centro_y = 0.0  # en AC seguimos centrando en 0V, es un offset, no una escala
 
-    rango_y_mitad = amplitud_div_v * 5.0 * factor_amp
+    rango_y_mitad = amplitud_div_v * 5.0
     plot.setYRange(centro_y - rango_y_mitad, centro_y + rango_y_mitad, padding=0)
 
-    amplitud_visual = amplitud_div_v * factor_amp
-    plot.getAxis('left').setTickSpacing(levels=[(amplitud_visual, 0)])
+    plot.getAxis('left').setTickSpacing(levels=[(amplitud_div_v, 0)])
 
-    voltios_trigger = (nivel_trigger * (V_REF / 4095.0)) * factor_amp
+    voltios_trigger = nivel_trigger * (V_REF / 4095.0)
     if modo_actual == 2:
         voltios_trigger -= (V_REF / 2.0)
     cursor_trig.setValue(voltios_trigger)
@@ -266,9 +268,9 @@ def actualizar_grafico():
     y_volts = np.array(trama['datos'], dtype=np.float64) * (V_REF / 4095.0)
 
     if modo_actual == 1:
-        y_volts = y_volts * 10.0
+        y_volts = y_volts * 10
     elif modo_actual == 2:
-        y_volts = y_volts - (V_REF / 2.0)
+        y_volts = (y_volts -1.3)/0.4
 
     curve.setData(x_tiempo_ms, y_volts)
 
@@ -279,7 +281,7 @@ def actualizar_grafico():
     txt_flanco = "SUBIDA" if flanco_trigger == 0 else "BAJADA"
     nombres_modo = ["CH5 (X1)", "CH6 (X10)", "CH2 (AC)"]
     txt_modo = nombres_modo[modo_actual] if modo_actual < len(nombres_modo) else "?"
-    amp_real = amplitud_div_v * (10.0 if modo_actual == 1 else 1.0)
+    amp_real = amplitud_div_v  # esto es lo que realmente se ve en la grilla del gráfico
 
     stats_html = f"""
         <span style='color: #FF5555; margin-right: 15px;'>Vmax: {v_max:.2f}V</span>

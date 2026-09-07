@@ -26,9 +26,9 @@ static const char *TAG = "OSCILOSCOPIO_FINAL";
 // Encoder y Botón
 #define EXAMPLE_PCNT_HIGH_LIMIT 100
 #define EXAMPLE_PCNT_LOW_LIMIT  -100
-#define EXAMPLE_EC11_GPIO_A 4
+#define EXAMPLE_EC11_GPIO_A 6
 #define EXAMPLE_EC11_GPIO_B 5
-#define BUTTON_GPIO 18
+#define BUTTON_GPIO 4
 
 // ADC
 #define EXAMPLE_ADC_UNIT             ADC_UNIT_1
@@ -80,8 +80,12 @@ typedef struct {
 // Estructura de parámetros para el menú
 typedef struct {
     SSD1306_t *display;
-    pcnt_unit_handle_t pcnt_unit;
 } menu_params_t;
+
+// Estructura de parámetros para la tarea del encoder
+typedef struct {
+    pcnt_unit_handle_t pcnt_unit;
+} encoder_params_t;
 
 // Estructura para empaquetar datos hacia la UART
 typedef struct {
@@ -92,6 +96,47 @@ typedef struct {
     float amplitud;
     modo_atenuacion_t modo; // <-- NUEVO PARÁMETRO
 } trama_uart_t;
+
+// ====================================================================
+// EVENTOS HACIA vMenuTask
+// ====================================================================
+// vMenuTask pasa a ser el punto central de procesamiento: vFlash, vEncoder,
+// vComandoUartTask y vButtonTask le avisan lo que pasó mediante esta cola de
+// eventos, en lugar de tocar directamente variables/colas que antes leía
+// por polling. Así vMenuTask puede quedar bloqueada en xQueueReceive()
+// esperando eventos, sin depender de un vTaskDelay() fijo.
+typedef enum {
+    EVT_BOTON_PRESIONADO,
+    EVT_ENCODER,
+    EVT_COMANDO_UART,
+    EVT_FLASH_CARGADA
+} menu_evento_tipo_t;
+
+typedef struct {
+    menu_evento_tipo_t tipo;
+    union {
+        int encoder_delta;                    // válido para EVT_ENCODER (+1 / -1)
+        config_osciloscopio_t config_recibida; // válido para EVT_COMANDO_UART y EVT_FLASH_CARGADA
+    } data;
+    bool flash_encontrada; // válido solo para EVT_FLASH_CARGADA
+} menu_evento_t;
+
+// ====================================================================
+// COMANDOS HACIA vFlash
+// ====================================================================
+// vMenuTask le pide a vFlash que cargue o guarde la configuración. vFlash
+// responde (cuando corresponde) mandando un EVT_FLASH_CARGADA por
+// menu_evento_queue. Así ninguna de las dos tareas queda bloqueada
+// esperando a la otra.
+typedef enum {
+    FLASH_CMD_CARGAR,
+    FLASH_CMD_GUARDAR
+} flash_cmd_tipo_t;
+
+typedef struct {
+    flash_cmd_tipo_t tipo;
+    config_osciloscopio_t config; // válido solo para FLASH_CMD_GUARDAR
+} flash_cmd_t;
 
 // ====================================================================
 // PROTOCOLO BINARIO DE TRANSMISIÓN (reemplaza el printf en ASCII)
@@ -124,6 +169,8 @@ typedef struct __attribute__((packed)) {
 static QueueHandle_t full_queue = NULL;
 static QueueHandle_t Uart_queue = NULL;
 static QueueHandle_t config_queue = NULL; // Mailbox
+static QueueHandle_t menu_evento_queue = NULL; // Eventos hacia vMenuTask (vFlash, vEncoder, vComandoUartTask, vButtonTask)
+static QueueHandle_t flash_cmd_queue = NULL;   // Pedidos de vMenuTask hacia vFlash
 
 // Semáforos
 static SemaphoreHandle_t button_semaphore = NULL; // Entregado por la ISR del botón
@@ -132,9 +179,6 @@ static SemaphoreHandle_t button_semaphore = NULL; // Entregado por la ISR del bo
 static TaskHandle_t xAdcTaskHandle = NULL;
 static TaskHandle_t xTriggerTaskHandle = NULL;
 static TaskHandle_t xUartTaskHandle = NULL;
-
-// Comunicación de UI
-volatile bool boton_presionado = false;
 
 // Buffers del ADC
 static uint8_t hardware_read_buffer[EXAMPLE_READ_LEN];
@@ -197,7 +241,12 @@ void vButtonTask(void *pvParameters) {
         // Bloqueada en el semáforo sin consumir CPU hasta que la ISR lo entregue
         if (xSemaphoreTake(button_semaphore, portMAX_DELAY) == pdTRUE) {
 
-            boton_presionado = true;
+            // Antes: boton_presionado = true; (variable global leída por polling
+            // desde vMenuTask). Ahora: se lo avisamos a vMenuTask por evento,
+            // tal como indica el esquema ("boton_presionado" -> vMenuTask).
+            menu_evento_t evt;
+            evt.tipo = EVT_BOTON_PRESIONADO;
+            xQueueSend(menu_evento_queue, &evt, portMAX_DELAY);
 
             // Esperamos a que el pin se estabilice en HIGH (botón soltado)
             // antes de rehabilitar la interrupción. Un delay fijo solo cubre
@@ -222,21 +271,79 @@ void vButtonTask(void *pvParameters) {
     }
 }
 
+// Tarea independiente del encoder rotativo (PCNT). Mantiene la misma lógica
+// de lectura y de umbral de 4 cuentas por "click" que antes vivía adentro de
+// vMenuTask, pero ahora, al detectar un giro, le manda un evento a
+// vMenuTask en vez de que vMenuTask lea el PCNT por polling.
+void vEncoder(void *pvParameters) {
+    encoder_params_t *params = (encoder_params_t *)pvParameters;
+    pcnt_unit_handle_t pcnt_unit = params->pcnt_unit;
+
+    int ultimo_conteo = 0;
+    int conteo_actual = 0;
+
+    while (1) {
+        ESP_ERROR_CHECK(pcnt_unit_get_count(pcnt_unit, &conteo_actual));
+        int diferencia = conteo_actual - ultimo_conteo;
+
+        if (diferencia >= 4 || diferencia <= -4) {
+            int direccion = (diferencia >= 4) ? 1 : -1;
+            ultimo_conteo = conteo_actual;
+
+            menu_evento_t evt;
+            evt.tipo = EVT_ENCODER;
+            evt.data.encoder_delta = direccion;
+            xQueueSend(menu_evento_queue, &evt, portMAX_DELAY);
+        }
+
+        // Mismo período que usaba antes el polling del encoder dentro de
+        // vMenuTask (vTaskDelay(30) al final del while(1)).
+        vTaskDelay(pdMS_TO_TICKS(30));
+    }
+}
+
+// Tarea independiente para la persistencia en flash (NVS). Recibe pedidos de
+// vMenuTask por flash_cmd_queue (cargar / guardar) y, cuando termina de
+// cargar, le devuelve el resultado a vMenuTask como EVT_FLASH_CARGADA por
+// menu_evento_queue. Con esto, vMenuTask nunca queda bloqueada esperando a
+// que termine una operación de NVS.
+void vFlash(void *pvParameters) {
+    flash_cmd_t cmd;
+    while (1) {
+        if (xQueueReceive(flash_cmd_queue, &cmd, portMAX_DELAY) == pdTRUE) {
+            if (cmd.tipo == FLASH_CMD_CARGAR) {
+                config_osciloscopio_t cfg_cargada;
+                bool encontrada = cargar_config_de_flash(&cfg_cargada);
+
+                menu_evento_t evt;
+                evt.tipo = EVT_FLASH_CARGADA;
+                evt.flash_encontrada = encontrada;
+                if (encontrada) {
+                    evt.data.config_recibida = cfg_cargada;
+                }
+                xQueueSend(menu_evento_queue, &evt, portMAX_DELAY);
+            }
+            else if (cmd.tipo == FLASH_CMD_GUARDAR) {
+                guardar_config_en_flash(&cmd.config);
+            }
+        }
+    }
+}
+
 void vMenuTask(void *pvParameters) {
     menu_params_t *params = (menu_params_t *)pvParameters;
     SSD1306_t *dev = params->display;
-    pcnt_unit_handle_t pcnt_unit = params->pcnt_unit;
 
     estado_menu_t estado_actual = ESTADO_MENU_PRINCIPAL;
     int opcion_principal = 0; 
     int sub_opcion = 0;       
-    int ultimo_conteo = 0;
-    int conteo_actual = 0;
     bool refrescar_pantalla = true; 
     
     // vMenuTask es la dueña del estado de configuración: arma el valor
-    // inicial (defaults, o lo último guardado en flash) y lo siembra en
-    // config_queue. app_main solo crea la cola vacía.
+    // inicial (defaults) y lo siembra en config_queue de entrada, para no
+    // dejar a las demás tareas (ADC, etc.) esperando. La carga de lo último
+    // guardado en flash se le pide a vFlash por evento y se aplica cuando
+    // llega la respuesta (EVT_FLASH_CARGADA), en vez de bloquear acá.
     config_osciloscopio_t config_activa = {
         .flanco = FLANCO_DESCENDENTE,
         .nivel = 2000,
@@ -244,87 +351,113 @@ void vMenuTask(void *pvParameters) {
         .amplitud_v = 1.0,
         .modo = MODO_X1 // <-- Arranca por defecto en canal 5 (GPIO 6)
     };
-    if (!cargar_config_de_flash(&config_activa)) {
-        ESP_LOGI(TAG, "No había config guardada en flash, arranco con los valores por defecto");
-    }
     xQueueOverwrite(config_queue, &config_activa);
+
+    flash_cmd_t cmd_carga_inicial = { .tipo = FLASH_CMD_CARGAR };
+    xQueueSend(flash_cmd_queue, &cmd_carga_inicial, portMAX_DELAY);
 
     while (1) {
 
-        xQueuePeek(config_queue, &config_activa, portMAX_DELAY);
+        // vMenuTask ya no hace polling con vTaskDelay(): queda bloqueada acá
+        // esperando el próximo evento de vFlash, vEncoder, vComandoUartTask
+        // o vButtonTask, tal como marca el esquema ("no debe quedar
+        // bloqueada por tiempo").
+        menu_evento_t evt;
+        if (xQueueReceive(menu_evento_queue, &evt, portMAX_DELAY) == pdTRUE) {
 
+            if (evt.tipo == EVT_ENCODER) {
+                int direccion = evt.data.encoder_delta;
 
-        ESP_ERROR_CHECK(pcnt_unit_get_count(pcnt_unit, &conteo_actual));
-        int diferencia = conteo_actual - ultimo_conteo;
-
-        if (diferencia >= 4 || diferencia <= -4) {
-            int direccion = (diferencia >= 4) ? 1 : -1;
-
-            if (estado_actual == ESTADO_MENU_PRINCIPAL) {
-                opcion_principal += direccion;
-                if (opcion_principal > 4) opcion_principal = 0; // Ahora hay 5 opciones (0 a 4)
-                if (opcion_principal < 0) opcion_principal = 4;
-            } 
-            else if (estado_actual == ESTADO_NIVEL_TRIG) {
-                if (direccion > 0 && config_activa.nivel <= 3800) config_activa.nivel += 200;
-                else if (direccion < 0 && config_activa.nivel >= 200) config_activa.nivel -= 200;
-                xQueueOverwrite(config_queue, &config_activa);
-            }
-            else {
-                sub_opcion += direccion;
-                
-                int max_opciones;
-                if (estado_actual == ESTADO_TIEMPO) max_opciones = 3; // 4 opciones (0.5, 1, 2, 5 ms)
-                else if (estado_actual == ESTADO_AMPLITUD) max_opciones = 1; // 2 opciones
-                else if (estado_actual == ESTADO_FLANCO) max_opciones = 1; // 2 opciones
-                else if (estado_actual == ESTADO_MODO) max_opciones = 2; // 3 opciones (X1, X10, AC)
-                else max_opciones = 0;
-
-                if (sub_opcion > max_opciones) sub_opcion = 0; 
-                if (sub_opcion < 0) sub_opcion = max_opciones;
-            }
-            ultimo_conteo = conteo_actual;
-            refrescar_pantalla = true; 
-        }
-
-        if (boton_presionado) {
-            boton_presionado = false; 
-            
-            if (estado_actual == ESTADO_MENU_PRINCIPAL) {
-                if (opcion_principal == 0) estado_actual = ESTADO_TIEMPO;
-                else if (opcion_principal == 1) estado_actual = ESTADO_AMPLITUD;
-                else if (opcion_principal == 2) estado_actual = ESTADO_FLANCO;
-                else if (opcion_principal == 3) estado_actual = ESTADO_NIVEL_TRIG;
-                else if (opcion_principal == 4) estado_actual = ESTADO_MODO;
-                sub_opcion = 0; 
-            } else {
-                if (estado_actual == ESTADO_TIEMPO) {
-                    // config_activa.tiempo_ms queda expresado en DÉCIMAS de ms
-                    // (5=0.5ms, 10=1ms, 20=2ms, 50=5ms) para poder representar 0.5 sin usar float
-                    if (sub_opcion == 0) config_activa.tiempo_ms = 5;
-                    else if (sub_opcion == 1) config_activa.tiempo_ms = 10;
-                    else if (sub_opcion == 2) config_activa.tiempo_ms = 20;
-                    else if (sub_opcion == 3) config_activa.tiempo_ms = 50;
+                if (estado_actual == ESTADO_MENU_PRINCIPAL) {
+                    opcion_principal += direccion;
+                    if (opcion_principal > 4) opcion_principal = 0; // Ahora hay 5 opciones (0 a 4)
+                    if (opcion_principal < 0) opcion_principal = 4;
                 } 
-                else if (estado_actual == ESTADO_AMPLITUD) {
-                    if (sub_opcion == 0) config_activa.amplitud_v = 1.0;
-                    else if (sub_opcion == 1) config_activa.amplitud_v = 5.0;
-                } 
-                else if (estado_actual == ESTADO_FLANCO) {
-                    if (sub_opcion == 0) config_activa.flanco = FLANCO_ASCENDENTE;
-                    else if (sub_opcion == 1) config_activa.flanco = FLANCO_DESCENDENTE;
+                else if (estado_actual == ESTADO_NIVEL_TRIG) {
+                    if (direccion > 0 && config_activa.nivel <= 3800) config_activa.nivel += 200;
+                    else if (direccion < 0 && config_activa.nivel >= 200) config_activa.nivel -= 200;
+                    xQueueOverwrite(config_queue, &config_activa);
                 }
-                else if (estado_actual == ESTADO_MODO) {
-                    if (sub_opcion == 0) config_activa.modo = MODO_X1;
-                    else if (sub_opcion == 1) config_activa.modo = MODO_X10;
-                    else if (sub_opcion == 2) config_activa.modo = MODO_AC;
+                else {
+                    sub_opcion += direccion;
+                    
+                    int max_opciones;
+                    if (estado_actual == ESTADO_TIEMPO) max_opciones = 3; // 4 opciones (0.5, 1, 2, 5 ms)
+                    else if (estado_actual == ESTADO_AMPLITUD) max_opciones = 1; // 2 opciones
+                    else if (estado_actual == ESTADO_FLANCO) max_opciones = 1; // 2 opciones
+                    else if (estado_actual == ESTADO_MODO) max_opciones = 2; // 3 opciones (X1, X10, AC)
+                    else max_opciones = 0;
+
+                    if (sub_opcion > max_opciones) sub_opcion = 0; 
+                    if (sub_opcion < 0) sub_opcion = max_opciones;
                 }
-                
-                xQueueOverwrite(config_queue, &config_activa);
-                guardar_config_en_flash(&config_activa);
-                estado_actual = ESTADO_MENU_PRINCIPAL;
             }
-            refrescar_pantalla = true; 
+            else if (evt.tipo == EVT_BOTON_PRESIONADO) {
+
+                if (estado_actual == ESTADO_MENU_PRINCIPAL) {
+                    if (opcion_principal == 0) estado_actual = ESTADO_TIEMPO;
+                    else if (opcion_principal == 1) estado_actual = ESTADO_AMPLITUD;
+                    else if (opcion_principal == 2) estado_actual = ESTADO_FLANCO;
+                    else if (opcion_principal == 3) estado_actual = ESTADO_NIVEL_TRIG;
+                    else if (opcion_principal == 4) estado_actual = ESTADO_MODO;
+                    sub_opcion = 0; 
+                } else {
+                    if (estado_actual == ESTADO_TIEMPO) {
+                        // config_activa.tiempo_ms queda expresado en DÉCIMAS de ms
+                        // (5=0.5ms, 10=1ms, 20=2ms, 50=5ms) para poder representar 0.5 sin usar float
+                        if (sub_opcion == 0) config_activa.tiempo_ms = 5;
+                        else if (sub_opcion == 1) config_activa.tiempo_ms = 10;
+                        else if (sub_opcion == 2) config_activa.tiempo_ms = 20;
+                        else if (sub_opcion == 3) config_activa.tiempo_ms = 50;
+                    } 
+                    else if (estado_actual == ESTADO_AMPLITUD) {
+                        if (sub_opcion == 0) config_activa.amplitud_v = 1.0;
+                        else if (sub_opcion == 1) config_activa.amplitud_v = 5.0;
+                    } 
+                    else if (estado_actual == ESTADO_FLANCO) {
+                        if (sub_opcion == 0) config_activa.flanco = FLANCO_ASCENDENTE;
+                        else if (sub_opcion == 1) config_activa.flanco = FLANCO_DESCENDENTE;
+                    }
+                    else if (estado_actual == ESTADO_MODO) {
+                        if (sub_opcion == 0) config_activa.modo = MODO_X1;
+                        else if (sub_opcion == 1) config_activa.modo = MODO_X10;
+                        else if (sub_opcion == 2) config_activa.modo = MODO_AC;
+                    }
+                    
+                    xQueueOverwrite(config_queue, &config_activa);
+
+                    // Antes: guardar_config_en_flash(&config_activa) se llamaba
+                    // acá mismo, de forma bloqueante. Ahora se lo pedimos a
+                    // vFlash por evento (flash_cmd_queue) para que vMenuTask no
+                    // se quede esperando a que termine la escritura en NVS.
+                    flash_cmd_t cmd_guardar = { .tipo = FLASH_CMD_GUARDAR, .config = config_activa };
+                    xQueueSend(flash_cmd_queue, &cmd_guardar, 0);
+
+                    estado_actual = ESTADO_MENU_PRINCIPAL;
+                }
+            }
+            else if (evt.tipo == EVT_COMANDO_UART) {
+                // Antes: vComandoUartTask hacía xQueueOverwrite(config_queue, ...)
+                // y guardar_config_en_flash(...) directamente. Eso quedó tachado
+                // en el esquema: ahora vComandoUartTask solo avisa por evento, y
+                // es vMenuTask quien aplica el cambio y le pide a vFlash que
+                // persista la configuración.
+                config_activa = evt.data.config_recibida;
+                xQueueOverwrite(config_queue, &config_activa);
+
+                flash_cmd_t cmd_guardar = { .tipo = FLASH_CMD_GUARDAR, .config = config_activa };
+                xQueueSend(flash_cmd_queue, &cmd_guardar, 0);
+            }
+            else if (evt.tipo == EVT_FLASH_CARGADA) {
+                if (evt.flash_encontrada) {
+                    config_activa = evt.data.config_recibida;
+                    xQueueOverwrite(config_queue, &config_activa);
+                } else {
+                    ESP_LOGI(TAG, "No había config guardada en flash, sigo con los valores por defecto");
+                }
+            }
+
+            refrescar_pantalla = true;
         }
 
         if (refrescar_pantalla) {
@@ -372,8 +505,6 @@ void vMenuTask(void *pvParameters) {
             ssd1306_show_buffer(dev);
             refrescar_pantalla = false; 
         }
-
-        vTaskDelay(pdMS_TO_TICKS(30)); 
     }
 }
 
@@ -402,9 +533,9 @@ void vAdcTask(void *pvParameters) {
                 }
 
                 // Selección del canal físico según el modo
-                adc_channel_t canal_activo = ADC_CHANNEL_5; // Default: MODO_X1 (GPIO 6)
-                if (cfg.modo == MODO_X10) canal_activo = ADC_CHANNEL_6; // MODO_X10 (GPIO 7)
-                else if (cfg.modo == MODO_AC) canal_activo = ADC_CHANNEL_2; // MODO_AC (GPIO 3)
+                adc_channel_t canal_activo = ADC_CHANNEL_0; // Default: MODO_X1 (GPIO 6)
+                if (cfg.modo == MODO_X10) canal_activo = ADC_CHANNEL_1; // MODO_X10 (GPIO 7)
+                else if (cfg.modo == MODO_AC) canal_activo = ADC_CHANNEL_6; // MODO_AC (GPIO 3)
 
                 // Re-inicialización del ADC con el nuevo canal
                 adc_continuous_handle_cfg_t adc_config = { // Configuración del handle del ADC continuo
@@ -621,7 +752,10 @@ void vComandoUartTask(void *pvParameters) {
                 uint16_t chk_calculado = calcular_checksum(buffer_rx, sizeof(comando_pc_t) - 2);
 
                 if (chk_calculado == cmd->checksum) {
-                    // El paquete es válido. Armamos la configuración y la enviamos al Mailbox.
+                    // El paquete es válido. Armamos la configuración y avisamos
+                    // a vMenuTask por evento (antes: xQueueOverwrite(config_queue,...)
+                    // y guardar_config_en_flash(...) acá mismo — esa comunicación
+                    // directa quedó tachada en el esquema).
                     config_osciloscopio_t nueva_config = {
                         .flanco = cmd->flanco,
                         .nivel = cmd->nivel,
@@ -629,8 +763,10 @@ void vComandoUartTask(void *pvParameters) {
                         .amplitud_v = cmd->amplitud_v,
                         .modo = cmd->modo
                     };
-                    xQueueOverwrite(config_queue, &nueva_config);
-                    guardar_config_en_flash(&nueva_config);
+                    menu_evento_t evt;
+                    evt.tipo = EVT_COMANDO_UART;
+                    evt.data.config_recibida = nueva_config;
+                    xQueueSend(menu_evento_queue, &evt, portMAX_DELAY);
                 }
                 
                 rx_index = 0; // Reiniciamos para buscar el próximo comando
@@ -655,9 +791,9 @@ void vUartTask(void *pvParameters) {
 // ====================================================================
 void app_main(void)
 {
-    // -- Inicializar memoria (tiene que ser lo primero: vMenuTask va a
-    // llamar a cargar_config_de_flash() apenas arranque a correr, y eso
-    // requiere que NVS ya esté inicializado)
+    // -- Inicializar memoria (tiene que ser lo primero: vFlash va a
+    // llamar a cargar_config_de_flash()/guardar_config_en_flash() apenas
+    // arranque a correr, y eso requiere que NVS ya esté inicializado)
     esp_err_t ret = nvs_flash_init();
     if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
         ESP_ERROR_CHECK(nvs_flash_erase());
@@ -680,6 +816,14 @@ void app_main(void)
     button_semaphore = xSemaphoreCreateBinary();
     
     config_queue = xQueueCreate(1, sizeof(config_osciloscopio_t));
+
+    // Colas nuevas para la arquitectura por eventos hacia vMenuTask.
+    // Profundidad 5 en menu_evento_queue para poder absorber ráfagas de
+    // eventos (encoder + botón + comando UART) sin bloquear a quien envía;
+    // flash_cmd_queue queda en 1, igual que las demás colas tipo mailbox
+    // del programa.
+    menu_evento_queue = xQueueCreate(5, sizeof(menu_evento_t));
+    flash_cmd_queue = xQueueCreate(1, sizeof(flash_cmd_t));
 
     // --- Encoder PCNT ---
     gpio_set_pull_mode(EXAMPLE_EC11_GPIO_A, GPIO_PULLUP_ONLY);
@@ -712,11 +856,11 @@ void app_main(void)
     ESP_ERROR_CHECK(pcnt_unit_clear_count(pcnt_unit));
     ESP_ERROR_CHECK(pcnt_unit_start(pcnt_unit));
 
-    // --- Pantalla OLED ---
+    // 7. Inicializar Pantalla SSD1306
     static SSD1306_t dev;
 #if CONFIG_I2C_INTERFACE
     ESP_LOGI(TAG, "Iniciando interfaz I2C");
-    i2c_master_init(&dev, 8, 9, -1);
+    i2c_master_init(&dev, CONFIG_SDA_GPIO, CONFIG_SCL_GPIO, CONFIG_RESET_GPIO);
 #endif
     ssd1306_init(&dev, 128, 64);
     ssd1306_contrast(&dev, 0xff);
@@ -737,7 +881,9 @@ void app_main(void)
     // --- Parámetros de Tareas ---
     static menu_params_t menu_parameters;
     menu_parameters.display = &dev;
-    menu_parameters.pcnt_unit = pcnt_unit;
+
+    static encoder_params_t encoder_parameters;
+    encoder_parameters.pcnt_unit = pcnt_unit;
 
     // --- Despliegue de Tareas ---
 
@@ -747,6 +893,8 @@ void app_main(void)
     xTaskCreatePinnedToCore(vUartTask, "vUartTask", 4096, NULL, 3, &xUartTaskHandle, 1); 
     xTaskCreatePinnedToCore(vButtonTask, "vButtonTask", 2048, NULL, 2, NULL, 1);
     xTaskCreatePinnedToCore(vMenuTask, "vMenuTask", 4096, &menu_parameters, 2, NULL, 1);
+    xTaskCreatePinnedToCore(vEncoder, "vEncoder", 2048, &encoder_parameters, 2, NULL, 1);
+    xTaskCreatePinnedToCore(vFlash, "vFlash", 4096, NULL, 1, NULL, 1);
 
     while (1) {
         vTaskDelay(portMAX_DELAY);
